@@ -1,0 +1,9 @@
+# Runtime state. The proxy writes these under %USERPROFILE%\.codex (or $CODEX_HOME),
+# never inside the repo — listed here only so a stray copy can't be committed.
+image-offload-cache.json
+image-offload-proxy.log
+proxy-stdout.log
+proxy-stderr.log
+*.log
+
+node_modules/
