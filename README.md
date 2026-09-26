@@ -224,3 +224,14 @@ Start-Process explorer.exe -ArgumentList 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0
 `maxRequestFilesBytes` 128 MiB，且图片会自动规范化到单边 ≤4096px、单张 ≤2 MiB。
 
 **这是桥，不是终点。**
+
+---
+
+## 许可
+
+Copyright (C) 2026 poke30744
+
+本项目采用 **GNU General Public License v3.0 or later**（GPL-3.0-or-later）。
+全文见 [LICENSE](LICENSE)。
+
+这意味着你可以自由使用、修改、再分发，但**衍生产品必须以同样的许可开源**。
