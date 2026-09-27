@@ -13,6 +13,12 @@
 // to a ~60-byte file_id reference. The model still sees every image; the
 // request just stops carrying the pixels.
 //
+// It also repairs a second, unrelated shape: Codex's create_thread delegation
+// emits a function_call_output with no call_id and nothing pairing with it,
+// which DeepSeek answers with 422 "missing field `call_id`" on every turn.
+// That item is rewritten into a plain user message. See the note above the
+// repair functions.
+//
 // Files expire server-side (observed ceiling ~30 days), so this is a stopgap.
 //
 // Usage:  node image-offload-proxy.mjs
@@ -186,6 +192,174 @@ async function offload(body, authHeader) {
   };
 }
 
+// --- orphan tool-output repair ---------------------------------------------
+//
+// Codex's create_thread delegation (the desktop app's "continue this work in a
+// new thread") seeds the new thread with a function_call_output for the
+// delegation, but nothing pairs with it and it carries no call_id. The
+// Responses API requires both, so DeepSeek rejects the whole request with
+//
+//   422 ... input: missing field `call_id`
+//
+// on every turn — Codex replays the item every time, so the thread never
+// recovers. The same call shows up in the *source* thread as a function_call
+// with no call_id either, so this is the app's own bookkeeping, not something
+// we can round-trip faithfully.
+//
+// Supplying a call_id is not enough. Upstream then wants the paired call
+// (400 "No tool call found for tool output with call_id ..."), and a
+// synthesized call trips the thinking-mode round-trip check (400 "The
+// `reasoning_text` in the thinking mode must be passed back"). So the item is
+// rewritten into a plain user message holding the same text: the handoff stays
+// visible to the model and no tool bookkeeping is invented. The output string
+// is spliced in verbatim — like the image path, nothing here re-serializes the
+// body.
+
+const ORPHAN_OUTPUT_TYPE = /"type"\s*:\s*"function_call_output"/g;
+
+const isWs = (c) => c === ' ' || c === '\n' || c === '\r' || c === '\t';
+
+/**
+ * Parse the object starting at `s[start]` (which must be '{').
+ * Returns { values, end }: `values` maps each direct key to the [from, to)
+ * offsets of its raw value text, `end` is the offset of the closing '}'.
+ * Values are located, never decoded, so nothing is re-serialized.
+ * Returns null if the text is not a well-formed object.
+ */
+function parseObject(s, start) {
+  const n = s.length;
+  const values = new Map();
+  let i = start + 1;
+
+  const ws = () => {
+    while (i < n && isWs(s[i])) i++;
+  };
+  /** s[j] is '"' -> offset just past the closing quote, else -1. */
+  const strEnd = (j) => {
+    for (j++; j < n; j++) {
+      if (s[j] === '\\') j++;
+      else if (s[j] === '"') return j + 1;
+    }
+    return -1;
+  };
+
+  if (s[start] !== '{') return null;
+  for (;;) {
+    ws();
+    if (s[i] === '}') return { values, end: i };
+    if (s[i] !== '"') return null;
+    const kEnd = strEnd(i);
+    if (kEnd < 0) return null;
+    const key = s.slice(i + 1, kEnd - 1);
+    i = kEnd;
+    ws();
+    if (s[i] !== ':') return null;
+    i++;
+    ws();
+
+    const from = i;
+    if (s[i] === '"') {
+      const e = strEnd(i);
+      if (e < 0) return null;
+      i = e;
+    } else if (s[i] === '{' || s[i] === '[') {
+      // skip a balanced container so commas inside it don't end the value
+      const open = s[i];
+      const close = open === '{' ? '}' : ']';
+      let depth = 0;
+      for (;;) {
+        if (i >= n) return null;
+        const c = s[i];
+        if (c === '"') {
+          const e = strEnd(i);
+          if (e < 0) return null;
+          i = e;
+          continue;
+        }
+        if (c === open) depth++;
+        else if (c === close) {
+          depth--;
+          i++;
+          if (depth === 0) break;
+          continue;
+        }
+        i++;
+      }
+    } else {
+      while (i < n && s[i] !== ',' && s[i] !== '}') i++;
+      while (i > from && isWs(s[i - 1])) i--;
+    }
+
+    values.set(key, [from, i]);
+    ws();
+    if (s[i] === ',') {
+      i++;
+      continue;
+    }
+    if (s[i] === '}') return { values, end: i };
+    return null;
+  }
+}
+
+/** True if the '{' at `j` opens an array element, i.e. follows '[' or ','. */
+function isArrayElement(s, j) {
+  let k = j - 1;
+  while (k >= 0 && isWs(s[k])) k--;
+  return k >= 0 && (s[k] === '[' || s[k] === ',');
+}
+
+/**
+ * The object containing the `"type"` token at `at`. Normally the nearest '{'
+ * to its left, but that can land inside an earlier string value, so walk
+ * further left until one actually parses. Input items are array elements, so
+ * anything else (a stray '{' inside a prompt or a tool output) is rejected —
+ * that keeps the rewrite from firing on text that merely quotes this shape.
+ */
+function objectAround(s, at) {
+  let j = at - 1;
+  for (let tries = 0; tries < 5 && j >= 0; tries++) {
+    while (j >= 0 && s[j] !== '{') j--;
+    if (j < 0) return null;
+    const obj = parseObject(s, j);
+    if (obj && at < obj.end && isArrayElement(s, j)) return { start: j, obj };
+    j--;
+  }
+  return null;
+}
+
+/** Rewrite every call_id-less function_call_output into a user message. */
+function repairOrphanToolOutputs(body) {
+  const hits = [...body.matchAll(ORPHAN_OUTPUT_TYPE)];
+  if (hits.length === 0) return { body, repaired: 0 };
+
+  let out = '';
+  let cursor = 0;
+  let repaired = 0;
+  for (const hit of hits) {
+    const found = objectAround(body, hit.index);
+    if (!found || found.start < cursor) continue;
+    // Only the exact shape: a function_call_output with no call_id and a
+    // string output. Anything else is left alone.
+    const type = found.obj.values.get('type');
+    const output = found.obj.values.get('output');
+    if (found.obj.values.has('call_id')) continue;
+    if (!type || body.slice(type[0], type[1]) !== '"function_call_output"') continue;
+    if (!output || body[output[0]] !== '"') {
+      log(`  ! orphan tool-output at offset ${hit.index} has no string output — left alone`);
+      continue;
+    }
+    out +=
+      body.slice(cursor, found.start) +
+      '{"type":"message","role":"user","content":[{"type":"input_text","text":' +
+      body.slice(output[0], output[1]) +
+      '}]}';
+    cursor = found.obj.end + 1;
+    repaired++;
+  }
+  if (repaired === 0) return { body, repaired: 0 };
+  return { body: out + body.slice(cursor), repaired };
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
 
@@ -219,6 +393,19 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       log(`offload crashed, forwarding original: ${e.message}`);
       body = raw;
+    }
+  }
+
+  // Runs after the image pass so the scan sees the smaller body.
+  let repaired = 0;
+  if (body.includes('function_call_output')) {
+    try {
+      const r = repairOrphanToolOutputs(body);
+      body = r.body;
+      repaired = r.repaired;
+      if (repaired) stats.after = Buffer.byteLength(body, 'utf8');
+    } catch (e) {
+      log(`orphan tool-output repair crashed, forwarding as-is: ${e.message}`);
     }
   }
 
@@ -281,7 +468,8 @@ const server = http.createServer(async (req, res) => {
     `${req.url}  ${upstream.status}  ` +
       `body ${mb(stats.before)} -> ${mb(stats.after)} MB  ` +
       `(images ${stats.offloaded}/${stats.total} offloaded${stats.failed ? `, ${stats.failed} left inline` : ''}, ` +
-      `saved ${mb(saved)} MB)  ${Date.now() - started}ms  last="${lastEvent}"${sawCompleted ? ' completed' : ''}${streamNote}`,
+      `saved ${mb(saved)} MB)${repaired ? `  [${repaired} orphan tool-output -> user message]` : ''}  ` +
+      `${Date.now() - started}ms  last="${lastEvent}"${sawCompleted ? ' completed' : ''}${streamNote}`,
   );
 });
 

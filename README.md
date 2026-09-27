@@ -43,6 +43,28 @@ Codex **没有任何办法使用 Files API**：配置参考里没有这个开关
 
 ---
 
+## 第二个作用：修复孤立的工具输出
+
+Codex 桌面端的 **`create_thread` 委派**（"在新线程里继续这项工作"）会给新线程塞一个
+`function_call_output`，但它**没有 `call_id`，也没有配对的 `function_call`**。
+Responses API 要求两者成对，所以每一轮都返回：
+
+```
+422 Unprocessable Entity: Failed to deserialize the JSON body into the target type:
+input: missing field `call_id`
+```
+
+和 413 一样，这个 item 每轮都被重放，**线程不会自愈**。
+
+代理把这个 item 改写成一条普通 user message，`output` 文本**逐字保留**——交接内容照旧对模型
+可见，只是不再走 tool 记账。日志里显示为 `[1 orphan tool-output -> user message]`。
+
+**不能靠补 `call_id` 解决**：补了会得到 `400 No tool call found for tool output with
+call_id ...`；再把配对的 `function_call` 也造出来，又会撞上 `400 The reasoning_text in the
+thinking mode must be passed back`。改写成 message 才绕得开。
+
+---
+
 ## 它怎么工作
 
 ```
@@ -54,7 +76,8 @@ Codex Desktop → codex.exe app-server
 ```
 
 代理把每张图从请求里抽出来、上传到 DeepSeek Files API、原地换成约 60 字节的 `file_id`。
-**模型仍然看得见每一张图**，只是请求不再携带像素。
+**模型仍然看得见每一张图**，只是请求不再携带像素。同时修补 `create_thread` 留下的
+孤立工具输出（见下一节）。
 
 实测：`49.11 MB -> 2.51 MB`，148 张截图全部保留。
 
@@ -123,6 +146,7 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 | `completed` | 上游正常收到 `response.completed` |
 | `WITHOUT response.completed` | 流被上游掐断 → Codex 会报 `stream closed before response.completed` |
 | `!! stream ...` | 流异常，附带最后一个事件名 |
+| `[1 orphan tool-output -> user message]` | 改写了 1 个孤立的工具输出（见"第二个作用"）。**正常现象，不是错误** |
 
 **一眼判断**：有 `completed` 且 `left inline` 为 0 = 完全健康。
 
@@ -167,6 +191,7 @@ wire_api = "responses"
 | `left inline` 不为 0 | 某些图上传反复失败 | 看日志 `! upload failed`；下一轮通常会补上 |
 | `offloaded` 是 `0/xxx` | Codex 换了序列化格式，代理静默失效 | 对照本文档的匹配形态改正则 |
 | `invalid image data URL` / 图片 400 | `file_id` 在该回放路径上不被接受 | 这条路走不通，回滚并考虑 dsh |
+| `422 ... missing field 'call_id'` | 委派线程里的孤立工具输出没被改写 | 确认跑的是最新版代理；日志里应有 `[N orphan tool-output -> user message]` |
 | 改了 `config.toml` 不生效 | app-server 还持有旧配置 | **两者都要重启** |
 
 ### 重启 Codex Desktop
@@ -203,8 +228,9 @@ Start-Process explorer.exe -ArgumentList 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0
 
 2. **CC Switch 一开就会覆盖 `base_url`**，代理被绕过。用代理期间别开它。
 
-3. **只处理 `"image_url": "data:image/..."` 这一种形态。** 其他写法原样透传。
-   Codex 若改了序列化格式，代理会静默失效——看 `offloaded` 是否为 0。
+3. **只处理 Codex 实际发出的两种形态**：`"image_url": "data:image/..."`，以及上面的孤立
+   `function_call_output`。其他写法原样透传。Codex 若改了序列化格式，代理会静默失效——
+   看 `offloaded` 是否为 0。
 
 4. **必须保留图片对模型可见。** 这是这个工具存在的理由。任何"丢图/缩图/换成文字"
    的改法都违背前提，即使能让请求变小。

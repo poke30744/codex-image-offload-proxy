@@ -1,8 +1,9 @@
 # CLAUDE.md
 
-Single-file Node proxy that keeps Codex sessions with many screenshots from dying on
-DeepSeek's 48 MiB request-body cap. Read `README.md` for the user-facing guide; this file
-is the working notes for changing the code.
+Single-file Node proxy that keeps Codex sessions usable against DeepSeek's gateway: it
+defuses the 48 MiB request-body cap that screenshots blow through, and repairs one item
+shape that Codex's thread delegation emits and DeepSeek's API rejects. Read `README.md`
+for the user-facing guide; this file is the working notes for changing the code.
 
 ## What it does
 
@@ -17,6 +18,20 @@ outbound request, uploads the bytes to DeepSeek's Files API (content-addressed, 
 and rewrites the part to a ~60-byte `file_id` reference. The model still sees every image.
 
 Measured: `49.11 MB -> 2.51 MB`, 148 screenshots preserved.
+
+## The second job: orphan tool outputs
+
+Codex's `create_thread` delegation (the desktop app's "continue this work in a new thread")
+seeds the new thread with a `function_call_output` for the delegation — but with no
+`call_id`, and nothing pairing with it. DeepSeek rejects that shape outright:
+
+```
+422 ... input: missing field `call_id`
+```
+
+on **every** turn, because Codex replays the item forever, exactly like the 413 case. The
+proxy rewrites that one item into a plain user message holding the same `output` text, so
+the handoff stays visible to the model and the thread recovers. Observed 2026-09-27.
 
 ## Layout
 
@@ -62,6 +77,11 @@ Two traps when writing that test:
   offload path. Use `crypto.randomBytes` for incompressible pixels.
 - Use a throwaway key path or delete the scratch script — it will contain an API key.
 
+The repair path has the same trap, and the same remedy: a 200 does not prove the text
+survived. POST an orphan `function_call_output` (no `call_id`, no matching `function_call`)
+and ask the model to quote a distinctive string out of its `output`. Against an unpatched
+proxy the identical body returns the 422 above.
+
 ## Invariants
 
 - **Images must stay visible to the model.** This is the whole point. A change that drops,
@@ -70,9 +90,15 @@ Two traps when writing that test:
 - **Never re-serialize the request body.** The rewrite is a targeted regex over the raw
   string so the bytes *around* each image are preserved verbatim (prompt-cache prefix).
   Parsing and re-stringifying the 49 MB body would churn everything.
-- **Only rewrite the one shape Codex emits**: `"image_url": "data:image/...;base64,..."`.
-  Anything else passes through untouched. If Codex changes its serialization the proxy goes
-  quietly inert — `offloaded` in the log drops to 0, which is the signal.
+- **Only rewrite shapes Codex actually emits**: `"image_url": "data:image/...;base64,..."`
+  and the orphan `function_call_output` described above. Anything else passes through
+  untouched. If Codex changes its serialization the proxy goes quietly inert — `offloaded`
+  in the log drops to 0, which is the signal.
+- **Repair an orphan tool output by rewriting it into a message, never by inventing a
+  `call_id`.** A `call_id` alone gets `400 No tool call found for tool output with call_id
+  ...`; synthesizing the paired `function_call` as well gets `400 The reasoning_text in the
+  thinking mode must be passed back`. Rewriting to a user message sidesteps tool bookkeeping
+  entirely. `N orphan tool-output -> user message` in the log is the counter to watch.
 - **Fail open.** An upload failure leaves that image inline rather than erroring the
   request. `left inline` in the log is the counter to watch.
 
